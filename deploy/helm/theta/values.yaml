@@ -1,0 +1,99 @@
+# Default values for the Theta GPU-reliability agent.
+#
+# Two deployment profiles:
+#   gpu.enabled=true  (default) — production GPU nodes managed by the NVIDIA
+#     GPU Operator: schedules only onto nodes labeled nvidia.com/gpu.present,
+#     runs under the `nvidia` RuntimeClass, and tolerates GPU-node taints.
+#   gpu.enabled=false — no GPU access requested; the agent starts in demo
+#     (synthetic telemetry) mode. Useful for chart development and CI on
+#     machines without NVIDIA hardware.
+
+image:
+  # Published multi-arch (amd64+arm64) by .github/workflows/release-images.yml
+  # on every version tag — `helm install` works with no local image import.
+  repository: ghcr.io/asomisetty27/theta-agent
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+gpu:
+  enabled: true
+  # RuntimeClass installed by the NVIDIA GPU Operator / nvidia-container-toolkit.
+  runtimeClassName: nvidia
+  # Schedule only onto nodes the GPU Operator has labeled as GPU-bearing.
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  # GPU nodes are commonly tainted to repel non-GPU workloads; monitoring
+  # agents (like the GPU Operator's own DCGM exporter) must tolerate that.
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+agent:
+  # Seconds between telemetry polls.
+  interval: 5
+  # Prometheus metrics port (container + service).
+  metricsPort: 9101
+  # Alert log path inside the container.
+  logPath: /var/log/theta/alerts.jsonl
+  # Extra environment variables passed straight to the container.
+  extraEnv: []
+  #  - name: THETA_WEBHOOK_URL
+  #    value: https://hooks.example.com/theta
+
+metrics:
+  service:
+    enabled: true
+    type: ClusterIP
+    # Standard Prometheus scrape annotations (for annotation-based discovery).
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9101"
+      prometheus.io/path: /metrics
+  # Prometheus Operator ServiceMonitor (requires the CRD to be installed).
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    additionalLabels: {}
+
+# theta-node-labeler — Go controller (controller/theta-node-labeler) that
+# reconciles theta.dev/gpu-health node labels from agent telemetry.
+labeler:
+  enabled: false
+  interval: 30s
+  image:
+    repository: ghcr.io/asomisetty27/theta-node-labeler
+    tag: ""          # defaults to .Chart.AppVersion (released in lockstep)
+    pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 512Mi
+
+securityContext:
+  runAsNonRoot: true
+  # Numeric UID/GID of the image's `theta` user — required so the kubelet can
+  # verify runAsNonRoot (the image sets a named USER, which can't be verified).
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+serviceAccount:
+  create: true
+  name: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Additional pod labels/annotations.
+podLabels: {}
+podAnnotations: {}
+
+# Priority class for the DaemonSet (monitoring agents often use system-node-critical).
+priorityClassName: ""

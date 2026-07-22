@@ -1,0 +1,22 @@
+{{- if .Values.metrics.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "theta.fullname" . }}-metrics
+  labels:
+    {{- include "theta.labels" . | nindent 4 }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.metrics.service.type }}
+  clusterIP: None
+  selector:
+    {{- include "theta.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.agent.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

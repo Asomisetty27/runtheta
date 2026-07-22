@@ -1,0 +1,180 @@
+"""
+Core metric types and R_theta computation.
+
+R_theta_eff(t) = (T_junction(t) - T_ref) / P_GPU(t)
+
+This is the foundational Theta metric. No other tool computes it.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional
+
+
+class GPUState(Enum):
+    UNKNOWN             = auto()
+    CLEAN_IDLE          = auto()   # low load, healthy thermals
+    UNDER_LOAD          = auto()   # high load, thermal equilibrium
+    ZOMBIE_RECOVERY     = auto()   # stuck P0, CUDA context retained
+    CHILD_EXIT_RECOVERY = auto()   # post child-exit, thermal lag
+    DRIFTING            = auto()   # R_theta rising above k·σ threshold
+    CRITICAL            = auto()   # R_theta exceeds critical threshold
+
+
+STATE_LABELS = {
+    GPUState.UNKNOWN:             "unknown",
+    GPUState.CLEAN_IDLE:          "clean_idle",
+    GPUState.UNDER_LOAD:          "under_load",
+    GPUState.ZOMBIE_RECOVERY:     "zombie_recovery",
+    GPUState.CHILD_EXIT_RECOVERY: "child_exit_recovery",
+    GPUState.DRIFTING:            "drifting",
+    GPUState.CRITICAL:            "critical",
+}
+
+# Classifier class index → GPUState (matches Stage 1 training order)
+CLASS_INDEX_TO_STATE = {
+    0: GPUState.CHILD_EXIT_RECOVERY,
+    1: GPUState.CLEAN_IDLE,
+    2: GPUState.UNDER_LOAD,
+    3: GPUState.ZOMBIE_RECOVERY,
+}
+
+
+@dataclass(slots=True)
+class RawSample:
+    """Single telemetry snapshot from pynvml."""
+    gpu_index:     int
+    timestamp:     float          # unix seconds
+    temp_junction: float          # °C  (T_junction from nvmlDeviceGetTemperature)
+    power_w:       float          # W   (nvmlDeviceGetPowerUsage / 1000)
+    util_pct:      float          # 0–100
+    mem_util_pct:  float          # 0–100
+    perf_state:    int            # 0–15 (P0 = max performance)
+    clock_sm_mhz:  int
+    clock_mem_mhz: int
+    fan_speed_pct: Optional[float] = None
+    # Silicon-level health fields (pynvml)
+    ecc_sbit:         int = 0    # single-bit ECC errors, volatile counter (correctable)
+    ecc_dbit:         int = 0    # double-bit ECC errors, volatile counter (uncorrectable → GPU death signal)
+    throttle_reasons: int = 0    # bitmask from nvmlDeviceGetCurrentClocksThrottleReasons
+    sm_clock_max_mhz: int = 0    # max boost SM clock — used for clock efficiency ratio
+    # Collector health (poll timing)
+    poll_latency_s:   float = 0.0  # seconds taken to collect this sample from NVML
+
+    # Lead-time instruments (leadtime_precursor_program 2026-07). Each carries
+    # a failure-class-specific precursor channel that no public fleet exporter
+    # we audited populates (GWDG's PCIe replay counter was identically zero),
+    # so Theta's own telemetry is the first fleet dataset to hold them.
+    # All optional: None/0 when the vendor query is unsupported.
+    mem_temp_c:          Optional[float] = None  # HBM/memory-junction temp (NVML field 140 / amdsmi VRAM) — F22 R_pkg numerator
+    pcie_replay_counter: int = 0   # monotonic replay count; rate at matched traffic = interconnect-fatigue precursor
+    pcie_link_width:     int = 0   # current lanes; downtrain vs max = detachment escalation rung
+    pcie_link_width_max: int = 0
+    pcie_link_gen:       int = 0   # current PCIe generation; gen drop = same escalation ladder
+    pcie_link_gen_max:   int = 0
+
+    # DCGM fields (populated only when use_dcgm=True and nv-hostengine is running)
+    nvlink_errors:    int   = 0    # total NVLink CRC + recovery errors (also NVML-filled by the base collector when readable)
+    pcie_tx_kbps:     int   = 0    # PCIe transmit throughput (KiB/s)
+    pcie_rx_kbps:     int   = 0    # PCIe receive throughput (KiB/s)
+    gr_engine_active: float = 0.0  # graphics/compute engine active fraction 0–1 (DCGM prof)
+    dram_active:      float = 0.0  # memory interface active fraction 0–1 (DCGM prof)
+    # DCGM throttle-cause accounting (fields 241 / 240 / 112). The NVML
+    # throttle_reasons bitmask above says WHY a clock is reduced *right now*;
+    # these add the duration dimension — monotonically-accumulating per-cause
+    # throttle-time counters — so downstream can take a per-interval delta and
+    # know HOW LONG the GPU spent thermal- vs power-limited. This is the signal
+    # DCGM exposes that the instantaneous bitmask cannot. Counters are in DCGM's
+    # violation-time unit (microseconds); only deltas are used, so the exact
+    # scale never matters to the detector.
+    thermal_violation_us:     int = 0   # DCGM 241 — accumulated thermal-throttle time
+    power_violation_us:       int = 0   # DCGM 240 — accumulated power-throttle time
+    dcgm_clock_event_reasons: int = 0   # DCGM 112 — clock-event bitmask (DCGM-sourced)
+
+
+@dataclass(slots=True)
+class EnrichedSample:
+    """RawSample + derived R_theta."""
+    raw:           RawSample
+    t_ref:         float          # virtual ambient (°C)
+    rtheta:        Optional[float]  # C/W — None when P_GPU < MIN_POWER
+    rtheta_valid:  bool           # False when denominator too small
+
+    @property
+    def gpu_index(self) -> int:
+        return self.raw.gpu_index
+
+    @property
+    def timestamp(self) -> float:
+        return self.raw.timestamp
+
+
+@dataclass
+class ClassifiedSample:
+    """EnrichedSample + classifier output."""
+    enriched:    EnrichedSample
+    state:       GPUState
+    confidence:  float          # 0–1, max class probability
+    rtheta_mean: Optional[float]  # mean R_theta over steady-state window
+
+    @property
+    def gpu_index(self) -> int:
+        return self.enriched.gpu_index
+
+    @property
+    def timestamp(self) -> float:
+        return self.enriched.timestamp
+
+
+@dataclass
+class AlertEvent:
+    """Emitted when a GPU transitions to an anomalous state."""
+    gpu_index:    int
+    timestamp:    float
+    state:        GPUState
+    prev_state:   GPUState
+    rtheta:       Optional[float]
+    rtheta_baseline: Optional[float]
+    drift_sigma:  Optional[float]   # how many σ above baseline
+    confidence:   float
+    message:      str
+    context:      dict = field(default_factory=dict)  # last N samples for explainability
+
+
+# ── R_theta computation ──────────────────────────────────────────────────────
+
+MIN_POWER_W = 5.0    # below this, R_theta is numerically unstable
+MIN_DELTA_T = 0.5    # below this ΔT, skip (noise floor)
+
+
+def compute_rtheta(
+    temp_junction: float,
+    t_ref: float,
+    power_w: float,
+) -> tuple[Optional[float], bool]:
+    """
+    Compute R_theta_eff = (T_junction - T_ref) / P_GPU.
+
+    Returns (rtheta, valid). valid=False when power is too low for a
+    reliable estimate, or any input is non-finite — caller should skip
+    classification but still record.
+    """
+    if not (math.isfinite(temp_junction) and math.isfinite(t_ref) and math.isfinite(power_w)):
+        return None, False
+    if power_w < MIN_POWER_W:
+        return None, False
+    delta_t = temp_junction - t_ref
+    if delta_t < MIN_DELTA_T:
+        return None, False
+    rtheta = delta_t / power_w
+    if not math.isfinite(rtheta):
+        return None, False
+    return rtheta, True
+
+
+def enrich(sample: RawSample, t_ref: float) -> EnrichedSample:
+    rtheta, valid = compute_rtheta(sample.temp_junction, t_ref, sample.power_w)
+    return EnrichedSample(raw=sample, t_ref=t_ref, rtheta=rtheta, rtheta_valid=valid)

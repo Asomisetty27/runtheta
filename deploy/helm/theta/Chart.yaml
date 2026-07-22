@@ -1,0 +1,22 @@
+apiVersion: v2
+name: theta
+description: >-
+  Theta — GPU thermal-power forensics agent. Runs as a per-node DaemonSet,
+  computes peer-relative effective thermal resistance (R_theta) from
+  NVML/DCGM telemetry, and exports Prometheus metrics on every GPU node.
+type: application
+version: 0.1.0
+appVersion: "0.1.12"
+home: https://github.com/Asomisetty27/theta
+sources:
+  - https://github.com/Asomisetty27/theta
+maintainers:
+  - name: Amogh Somisetty
+    email: asomisetty27@gmail.com
+keywords:
+  - gpu
+  - nvidia
+  - monitoring
+  - thermal
+  - reliability
+  - prometheus

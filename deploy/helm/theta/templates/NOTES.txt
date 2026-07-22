@@ -1,0 +1,13 @@
+Theta {{ .Chart.AppVersion }} deployed as DaemonSet {{ include "theta.fullname" . }}.
+
+Mode: {{ if .Values.gpu.enabled }}GPU (NVIDIA GPU Operator nodes — runtimeClass "{{ .Values.gpu.runtimeClassName }}", selector nvidia.com/gpu.present){{ else }}demo (no GPU requested — synthetic telemetry){{ end }}
+
+Check agent pods:
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
+
+Scrape a node's metrics locally:
+  kubectl port-forward ds/{{ include "theta.fullname" . }} {{ .Values.agent.metricsPort }}:{{ .Values.agent.metricsPort }}
+  curl -s localhost:{{ .Values.agent.metricsPort }}/metrics | grep theta
+
+Prometheus discovers pods via the annotated headless service
+({{ include "theta.fullname" . }}-metrics){{ if .Values.metrics.serviceMonitor.enabled }} and the ServiceMonitor{{ end }}.

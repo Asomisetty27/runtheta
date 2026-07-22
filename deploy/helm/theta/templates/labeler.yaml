@@ -1,0 +1,87 @@
+{{- if .Values.labeler.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "theta.fullname" . }}-labeler
+  labels:
+    {{- include "theta.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-labeler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "theta.fullname" . }}-labeler
+  labels:
+    {{- include "theta.labels" . | nindent 4 }}
+rules:
+  # Observe: find the Theta agent pods (for node name + pod IP).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  # Reconcile: write health labels onto nodes.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "theta.fullname" . }}-labeler
+  labels:
+    {{- include "theta.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "theta.fullname" . }}-labeler
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "theta.fullname" . }}-labeler
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "theta.fullname" . }}-labeler
+  labels:
+    {{- include "theta.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-labeler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "theta.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node-labeler
+  template:
+    metadata:
+      labels:
+        {{- include "theta.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node-labeler
+    spec:
+      serviceAccountName: {{ include "theta.fullname" . }}-labeler
+      containers:
+        - name: labeler
+          image: {{ .Values.labeler.image.repository }}:{{ .Values.labeler.image.tag | default .Chart.AppVersion }}
+          imagePullPolicy: {{ .Values.labeler.image.pullPolicy }}
+          args:
+            - -interval={{ .Values.labeler.interval }}
+            - -namespace={{ .Release.Namespace }}
+            - -selector=app.kubernetes.io/name={{ include "theta.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=agent
+            - -metrics-port={{ .Values.agent.metricsPort }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            # distroless "nonroot" numeric UID/GID — kubelet cannot verify a
+            # named USER against runAsNonRoot.
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

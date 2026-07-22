@@ -1,0 +1,203 @@
+"""
+Characterization tests for the peer-relative detector (theta/agent/peer.py).
+
+The headline test reproduces E009: a single degraded GPU among matched-power
+node-mates is blind-flagged with NO temporal history — the capability the
+temporal DriftDetector structurally cannot provide. The remainder pin the
+guard rails that keep the false-positive budget tight (the thing that makes
+this safe to ship as a fleet default).
+"""
+
+from theta.agent.peer import (
+    PeerRelativeDetector, median_polish_z, _power_matched, MIN_GROUP, SUSTAINED,
+)
+
+
+def _drive(det, snapshot, cycles, t0=1000.0):
+    """Run `cycles` evaluations on the same snapshot; return the last result."""
+    out = {}
+    for i in range(cycles):
+        out = det.evaluate(snapshot, t0 + i)
+    return out
+
+
+def test_e009_reproduction_blind_flags_degraded_unit():
+    # 8-GPU H100 node, all at ~650 W (matched load, the E009 incident job).
+    # Healthy same-model node-mates under matched load cluster tightly (~1 °C)
+    # → R_θ ≈ 0.055 C/W. The degraded unit ran 80 °C @ 653 W → R_θ ≈ 0.084
+    # (+50%). On this tight, low-R_θ fleet the relative floor is the binding
+    # scale (a T4-scale absolute floor would have MISSED it); it recovers the
+    # E009-scale robust-z (the real unit measured +15.6).
+    healthy = [(650.0, 0.0540 + 0.0004 * i) for i in range(7)]  # 0.0540..0.0564
+    snapshot = {g: healthy[g] for g in range(7)}
+    snapshot[7] = (653.0, 0.084)                                # degraded
+
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED)
+
+    deg = res[7]
+    assert deg.is_anomaly, "degraded unit should be flagged peer-relative"
+    assert deg.robust_z > 8.0, f"expected an E009-scale robust-z, got {deg.robust_z}"
+    assert deg.n_peers >= MIN_GROUP - 1
+    # No healthy unit should be flagged.
+    assert not any(res[g].is_anomaly for g in range(7))
+
+
+def test_uniform_fleet_produces_no_anomaly():
+    # A genuinely uniform fleet must stay silent indefinitely.
+    snapshot = {g: (400.0, 0.30 + 0.002 * g) for g in range(8)}
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED * 3)
+    assert not any(r.is_anomaly for r in res.values())
+    assert all(abs(r.robust_z) < 4.0 for r in res.values())
+
+
+def test_below_min_group_never_alarms():
+    # Three GPUs (group < MIN_GROUP) with a blatant outlier: no peer group is
+    # trustworthy enough, so the detector must say nothing.
+    snapshot = {0: (500.0, 0.12), 1: (500.0, 0.12), 2: (500.0, 0.40)}
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED * 2)
+    assert all(not r.is_anomaly for r in res.values())
+    assert res[2].robust_z is None  # not enough peers to evaluate
+
+
+def test_power_conditioning_excludes_unmatched_load():
+    # One idle GPU (low power → naturally high R_θ) among loaded peers must NOT
+    # be flagged: it has no matched-power peer group, so it is not compared
+    # against the loaded cohort. This is the R_θ(P)-is-a-curve guard.
+    snapshot = {g: (600.0, 0.12 + 0.003 * g) for g in range(6)}
+    snapshot[6] = (40.0, 1.25)   # idle: high R_θ, but unmatched power
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED * 2)
+    assert res[6].robust_z is None         # no matched-power peers → not judged
+    assert not any(r.is_anomaly for r in res.values())
+
+
+def test_single_cycle_spike_does_not_alert():
+    base = {g: (650.0, 0.12) for g in range(7)}
+    det = PeerRelativeDetector()
+    # One spiking cycle for GPU 7…
+    spike = dict(base); spike[7] = (650.0, 0.30)
+    r1 = det.evaluate(spike, 1000.0)
+    assert not r1[7].is_anomaly, "a single anomalous cycle must not alert"
+    # …then it returns to normal; sustained counter decays, no alert.
+    ok = dict(base); ok[7] = (650.0, 0.121)
+    r2 = det.evaluate(ok, 1005.0)
+    assert not r2[7].is_anomaly
+
+
+def test_sustained_outlier_escalates_to_critical():
+    snapshot = {g: (650.0, 0.12) for g in range(7)}
+    snapshot[7] = (650.0, 0.40)   # ~+230%, way past Z_CRITICAL
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED)
+    assert res[7].is_critical
+    assert res[7].confidence == 1.0
+
+
+def test_mad_floor_prevents_screaming_z_on_near_uniform_fleet():
+    # All GPUs nearly identical (MAD ≈ 0) with one a hair high. Without a scale
+    # floor this would divide by ~0 and scream; the floor keeps z sane.
+    snapshot = {g: (500.0, 0.2000) for g in range(7)}
+    snapshot[7] = (500.0, 0.2030)   # +1.5% — real but trivial
+    det = PeerRelativeDetector()
+    res = _drive(det, snapshot, SUSTAINED * 2)
+    assert not res[7].is_anomaly
+    assert abs(res[7].robust_z) < 4.0
+
+
+def test_power_matched_helper():
+    assert _power_matched(600.0, 650.0, 0.15)        # within 15%
+    assert not _power_matched(600.0, 800.0, 0.15)    # 33% apart
+    assert not _power_matched(600.0, 0.0, 0.15)      # zero/invalid power
+
+
+# ── Position-conditioned median polish (the full E009 fleet method) ───────────
+
+def test_median_polish_recovers_position_masked_anomaly():
+    # Synthetic 8-node × 8-ordinal fleet with a real HGX-position structure
+    # (hot ordinals 0,3,4,6 like the validation fleet) plus one degraded GPU sitting in a
+    # STRUCTURALLY-COOL slot — so within-node it looks fine, but after position
+    # correction it is a clear outlier. This is the node-05:2 situation.
+    mu = 0.057
+    pos = {0: +0.006, 1: -0.003, 2: -0.007, 3: +0.003,
+           4: +0.007, 5: -0.006, 6: +0.005, 7: -0.004}
+    fleet = {}
+    gid = 0
+    for n in range(8):
+        node_eff = (n - 3.5) * 0.0004
+        for o in range(8):
+            r = mu + node_eff + pos[o]
+            fleet[gid] = (f"n{n}", o, r)
+            gid += 1
+    # Degrade one GPU in a cool slot (ordinal 2) on node n5 by +0.010 (~+17%).
+    masked_id = next(g for g, (nn, oo, _) in fleet.items() if nn == "n5" and oo == 2)
+    nn, oo, r = fleet[masked_id]
+    fleet[masked_id] = (nn, oo, r + 0.010)
+
+    z = median_polish_z(fleet)
+    assert z[masked_id] > 3.0, f"position-masked anomaly should surface, got {z[masked_id]}"
+    # Nobody else should clear z>3.
+    others = [v for k, v in z.items() if k != masked_id]
+    assert max(others) < 3.0
+
+
+def test_median_polish_uniform_fleet_is_quiet():
+    mu = 0.060
+    pos = {o: (o - 3.5) * 0.002 for o in range(8)}
+    fleet = {}
+    gid = 0
+    for n in range(6):
+        for o in range(8):
+            fleet[gid] = (f"n{n}", o, mu + pos[o] + n * 0.0003)
+            gid += 1
+    z = median_polish_z(fleet)
+    assert all(abs(v) < 3.0 for v in z.values())
+
+
+class TestF21PositionLimitation:
+    """Characterization of the F21 (2026-07-14) known limitation, measured on a
+    rented 8x A100 HGX node: matched-power groups can still carry board-half
+    position structure, and at n=4 a healthy hot-half GPU is indistinguishable
+    from a genuine outlier WITHIN the node. The fix is scope, not tuning:
+    fleet-level median_polish_z (same-slot pools across nodes) resolves it.
+    This test pins the current node-scope behavior so any change to it is a
+    deliberate decision, not an accident. Do NOT 'fix' by loosening thresholds."""
+
+    def test_d9_hetero_matched_group_flags_healthy_hot_half_gpu(self):
+        # Measured medians from the D9 heterogeneous phase (fixed duty cycle):
+        # matched-power group at ~400W = gpus {0, 2, 4, 5}; gpu4 is in the hot
+        # board half (healthy, +45% position spread), R values in C/W.
+        det = PeerRelativeDetector()
+        snapshot = {
+            0: (398.2, 0.0678),
+            2: (395.3, 0.0632),
+            4: (400.9, 0.0973),   # healthy — hot board half
+            5: (424.8, 0.0636),
+        }
+        last = None
+        for t in range(4):  # SUSTAINED = 3
+            last = det.evaluate(snapshot, timestamp=1000.0 + t)
+        r4 = last[4]
+        # Pinned current behavior: node-scope detector flags the healthy unit.
+        assert r4.robust_z is not None and r4.robust_z > 8.0
+        assert r4.is_critical, (
+            "If this stopped flagging, confirm the change is position-awareness "
+            "(good, update F21) and not threshold loosening (would also hide "
+            "E009-class real outliers)."
+        )
+
+    def test_fleet_median_polish_resolves_the_same_pattern(self):
+        # Same position structure replicated across 4 nodes: median polish
+        # removes the ordinal effect — no unit stands out (all healthy).
+        fleet = {}
+        gid = 0
+        for node in ("n1", "n2", "n3", "n4"):
+            for ordinal, r in ((0, 0.068), (2, 0.063), (4, 0.097), (5, 0.064)):
+                fleet[gid] = (node, ordinal, r + 0.001 * (gid % 3))
+                gid += 1
+        z = median_polish_z(fleet)
+        assert max(abs(v) for v in z.values()) < 4.0, (
+            "position-conditioned fleet scoring must absorb board-half structure"
+        )
